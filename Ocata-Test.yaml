@@ -1,0 +1,225 @@
+heat_template_version: 2015-10-15
+
+description: OpenStack Ocata with DevStack over one controller node and a configurable number of compute nodes
+
+parameters:
+  compute_node_count:
+    type: number
+    label: Number of compute nodes
+    description: Number of compute nodes in this OpenStack deployment
+    default: 2
+    constraints:
+      - range: { min: 1 }
+        description: There must be at least one compute node.
+  key_name:
+    type: string
+    label: Key name
+    description: Name of a key pair to enable SSH access to the instance
+    default: default
+    constraints:
+    - custom_constraint: nova.keypair
+  reservation_id:
+    type: string
+    label: Reservation
+    description: Blazar reservation to use for launching instances
+    constraints:
+    - custom_constraint: blazar.reservation
+
+resources:
+  control_node:
+    type: OS::Nova::Server
+    properties:
+      name: ControlNode-Instance
+      flavor: baremetal
+      image: CC-Ubuntu16.04
+      key_name: { get_param: key_name }
+      networks:
+         - network: sharednet1
+      scheduler_hints: { reservation: { get_param: reservation_id } }
+      user_data_format: RAW
+      user_data: |
+        #cloud-config
+        users:
+          - default
+          - name: stack
+            lock_passwd: False
+            sudo: ["ALL=(ALL) NOPASSWD:ALL\nDefaults:stack !requiretty"]
+            shell: /bin/bash
+        write_files:
+          - content: |
+                #!/bin/bash
+                sudo apt-get update
+                sudo apt-get install -y git python-pip vim screen
+                sudo apt-get upgrade -y python
+                sudo apt-get -y install apache2
+                sudo systemctl start apache2.service
+                sudo chown stack:stack /home/stack
+                touch host
+                sudo sed -e "s/[  ]*127.0.0.1[  ]*localhost[  ]*$/127.0.0.1 localhost $HOSTNAME/" /etc/hosts > host
+                sudo cp -f host /etc/hosts
+                cd /home/stack
+                git clone https://github.com/openstack-dev/devstack.git -b stable/ocata
+                sudo chown -R stack:stack /home/stack/*
+                cd devstack
+                HOST_IP=$(/sbin/ifconfig eno1 | grep 'inet addr' | cut -d: -f2 | awk '{print $1}')
+                cat <<EOF | cat > local.conf
+                [[local|localrc]]
+                #credential
+                SERVICE_TOKEN=secret
+                ADMIN_PASSWORD=secret
+                MYSQL_PASSWORD=secret
+                RABBIT_PASSWORD=secret
+                SERVICE_PASSWORD=secret
+                #network
+                FLAT_INTERFACE=eth0
+                FIXED_RANGE=192.168.1.0/24
+                NETWORK_GATEWAY=192.168.1.1
+                FIXED_NETWORK_SIZE=4096
+                HOST_IP=$HOST_IP
+                FLOATING_RANGE=10.50.0.0/23
+                Q_FLOATING_ALLOCATION_POOL="start=10.50.0.2,end=10.50.0.254"
+                PUBLIC_NETWORK_GATEWAY=10.50.1.254
+                #multi_host
+                MULTI_HOST=1
+                # Enable Logging
+                LOGFILE=/opt/stack/logs/stack.sh.log
+                VERBOSE=True
+                LOG_COLOR=True
+                SCREEN_LOGDIR=/opt/stack/logs
+                #service
+                disable_service n-net
+                enable_service q-svc
+                enable_service q-agt
+                enable_service q-dhcp
+                enable_service q-l3
+                enable_service q-meta
+                enable_service neutron
+                enable_service q-fwaas
+                enable_service q-vpn
+                enable_service q-lbaas
+                Q_PLUGIN=ml2
+                Q_ML2_TENANT_NETWORK_TYPE=vxlan
+                Q_AGENT=linuxbridge
+                EOF
+                cat <<EOF | cat > local.sh
+                for i in `seq 2 10`; do /opt/stack/nova/bin/nova-manage fixed reserve 192.168.1.$i; done
+                EOF
+                ./stack.sh
+                # Launch a simple webserver on port 6464. Slaves will check this
+                # port: if it listening, they will start to run their slave.sh
+                # script.
+                screen -dm bash -c "python -m SimpleHTTPServer 6464"
+                source openrc admin
+                # Configure DNS server
+                neutron subnet-update public-subnet --dns_nameservers list=true 8.8.8.8
+                neutron subnet-update private-subnet --dns_nameservers list=true 8.8.8.8
+                # Add security group rule to allow ICMP, SSH, and HTTP
+                nova secgroup-add-rule default icmp -1 -1 0.0.0.0/0
+                nova secgroup-add-rule default tcp 22 22 0.0.0.0/0
+                nova secgroup-add-rule default tcp 80 80 0.0.0.0/0
+            path: /home/stack/start.sh
+            permissions: 0755
+        runcmd:
+          - cd /home/stack
+          - pwd
+          - su -l stack ./start.sh
+
+
+  compute_node:
+    type: OS::Heat::ResourceGroup
+    properties:
+      count: { get_param: compute_node_count }
+      resource_def:
+        type: OS::Nova::Server
+        properties:
+          name: ComputeNode%index%
+          flavor: baremetal
+          image: CC-Ubuntu16.04
+          key_name: { get_param: key_name }
+          networks:
+             - network: sharednet1
+          scheduler_hints: { reservation: { get_param: reservation_id } }
+          user_data_format: RAW
+          user_data:
+            str_replace:
+              params:
+                $master_ip$: { get_attr: [control_node, first_address] }
+              template: |
+                #cloud-config
+                users:
+                  - default
+                  - name: stack
+                    lock_passwd: False
+                    sudo: ["ALL=(ALL) NOPASSWD:ALL\nDefaults:stack !requiretty"]
+                    shell: /bin/bash
+                write_files:
+                  - content: |
+                        #!/bin/bash
+                        sudo apt-get update
+                        sudo apt-get install -y git python-pip vim
+                        sudo apt-get upgrade -y python
+                        sudo apt-get -y install apache2
+                        sudo systemctl start apache2.service
+                        sudo chown stack:stack /home/stack
+                        touch host
+                        sudo sed -e "s/[        ]*127.0.0.1[    ]*localhost[    ]*$/127.0.0.1 localhost $HOSTNAME/" /etc/hosts > host
+                        sudo cp -f host /etc/hosts
+                        cd /home/stack
+                        git clone https://github.com/openstack-dev/devstack.git -b stable/ocata
+                        sudo chown -R stack:stack /home/stack/*
+                        cd devstack
+                        SERVICE_HOST=$master_ip$
+                        HOST_IP=$(/sbin/ifconfig eno1 | grep 'inet addr' | cut -d: -f2 | awk '{print $1}')
+                        cat <<EOF | cat > local.conf
+                        [[local|localrc]]
+                        #credential
+                        SERVICE_TOKEN=secret
+                        ADMIN_PASSWORD=secret
+                        MYSQL_PASSWORD=secret
+                        RABBIT_PASSWORD=secret
+                        SERVICE_PASSWORD=secret
+                        #network
+                        FLAT_INTERFACE=eth0
+                        FIXED_RANGE=192.168.1.0/24
+                        NETWORK_GATEWAY=192.168.1.1
+                        FIXED_NETWORK_SIZE=4096
+                        HOST_IP=$HOST_IP
+                        FLOATING_RANGE=10.50.0.0/23
+                        Q_FLOATING_ALLOCATION_POOL="start=10.50.0.2,end=10.50.0.254"
+                        PUBLIC_NETWORK_GATEWAY=10.50.1.254
+                        #multi_host
+                        MULTI_HOST=1
+                        SERVICE_HOST=$SERVICE_HOST
+                        DATABASE_TYPE=mysql
+                        MYSQL_HOST=$SERVICE_HOST
+                        RABBIT_HOST=$SERVICE_HOST
+                        GLANCE_HOSTPORT=$SERVICE_HOST:9292
+                        Q_HOST=$SERVICE_HOST
+                        KEYSTONE_AUTH_HOST=$SERVICE_HOST
+                        KEYSTONE_SERVICE_HOST=$SERVICE_HOST
+                        CINDER_SERVICE_HOST=$SERVICE_HOST
+                        NOVA_VNC_ENABLED=True
+                        NOVNCPROXY_URL="http://$SERVICE_HOST:6080/vnc_auto.html"
+                        VNCSERVER_LISTEN=$HOST_IP
+                        VNCSERVER_PROXYCLIENT_ADDRESS=$HOST_IP
+                        #service
+                        ENABLED_SERVICES=n-cpu,q-agt,n-api-meta,c-vol,placement-client
+                        Q_PLUGIN=ml2
+                        Q_ML2_TENANT_NETWORK_TYPE=vxlan
+                        Q_AGENT=linuxbridge
+                        # Enable Logging
+                        LOGFILE=/opt/stack/logs/stack.sh.log
+                        VERBOSE=True
+                        LOG_COLOR=True
+                        SCREEN_LOGDIR=/opt/stack/logs
+                        EOF
+                        # Check wait until the controller node has completed his
+                        # devstack installation.
+                        until $(curl --output /dev/null --silent --head --fail http://$master_ip$:6464); do printf '.'; sleep 2; done;
+                        ./stack.sh
+                    path: /home/stack/start.sh
+                    permissions: 0755
+                runcmd:
+                  - cd /home/stack
+                  - pwd
+                  - su -l stack ./start.sh

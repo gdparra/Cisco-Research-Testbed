@@ -1,0 +1,322 @@
+heat_template_version: 2015-10-15
+
+description: OpenStack Mitaka with DevStack over one controller node and a configurable number of compute nodes
+
+parameters:
+  compute_node_count:
+    type: number
+    label: Number of compute nodes
+    description: Number of compute nodes in this OpenStack deployment
+    default: 2
+    constraints:
+      - range: { min: 1 }
+        description: There must be at least one compute node.
+  key_name:
+    type: string
+    label: Key name
+    description: Name of a key pair to enable SSH access to the instance
+    default: default
+    constraints:
+    - custom_constraint: nova.keypair
+  reservation_id:
+    type: string
+    label: Reservation
+    description: Blazar reservation to use for launching instances
+    constraints:
+    - custom_constraint: blazar.reservation
+
+resources:
+  control_node:
+    type: OS::Nova::Server
+    properties:
+      name: ControlNode-Instance
+      flavor: baremetal
+      image: CC-Ubuntu14.04
+      key_name: { get_param: key_name }
+      networks:
+         - network: sharednet1
+      scheduler_hints: { reservation: { get_param: reservation_id } }
+      user_data_format: RAW
+      user_data: |
+        #cloud-config
+        users:
+          - default
+          - name: stack
+            lock_passwd: False
+            sudo: ["ALL=(ALL) NOPASSWD:ALL\nDefaults:stack !requiretty"]
+            shell: /bin/bash
+        write_files:
+          - content: |
+                #!/bin/bash
+                sudo set -x
+                sudo exec &> >(tee -a /home/stack/postlog.log)
+                sudo apt-get update
+                sudo apt-get install -y git python-pip vim screen
+                sudo apt-get upgrade -y python
+                sudo chown stack:stack /home/stack
+                touch host
+                sudo sed -e "s/[  ]*127.0.0.1[  ]*localhost[  ]*$/127.0.0.1 localhost $HOSTNAME/" /etc/hosts > host
+                sudo cp -f host /etc/hosts
+                #sudo su -c "useradd stack -s /bin/bash -m -g cc -G cc"
+                #sudo sed -i '$a stack ALL=(ALL) NOPASSWD: ALL' /etc/sudoers
+                cd /home/stack
+                git clone https://github.com/openstack-dev/devstack.git -b stable/mitaka
+                sudo chown -R stack:stack /home/stack/*
+                cd devstack
+                git apply <<EOF
+                diff --git a/tools/install_pip.sh b/tools/install_pip.sh
+                index 5d314c8..a9c5fd0 100755
+                --- a/tools/install_pip.sh
+                +++ b/tools/install_pip.sh
+                @@ -135,8 +135,8 @@ fi
+                 
+                 set -x
+                 
+                -# Note setuptools is part of requirements.txt and we want to make sure
+                -# we obey any versioning as described there.
+                -pip_install_gr setuptools
+                +# Pin setuptools to avoid breakage caused by openstack.nose-plugin (see
+                +# https://bugs.launchpad.net/devstack/+bug/1651292/ for details).
+                +pip_install -U setuptools==30.4.0
+                 
+                 get_versions
+                EOF
+                HOST_IP=$(/sbin/ifconfig eth0 | grep 'inet addr' | cut -d: -f2 | awk '{print $1}')
+                #VAR=$(ip addr | grep 'state UP' -A2 | tail -n1 | awk '{print $2}' | cut -f1  -d'/')
+                #printf '\nHOST_IP=%s'$VAR'\n' >> local.conf
+                #printf ' address '$VAR'\n'>> interface
+                #git clone https://github.com/BAbrandon/ScriptsForHeat.git
+                touch interface
+                cat <<EOF | cat > interface
+                auto eth0
+                iface eth0 inet static
+                        address $HOST_IP
+                        netmask 255.255.254.0
+                        broadcast 10.40.1.255
+                        gateway 10.40.1.254
+                EOF
+                sudo cp -f interface /etc/network/interfaces
+                #sudo ifdown eth0
+                #sudo ifup eth0
+                cat <<EOF | cat > local.conf
+                [[local|localrc]]
+                #credential
+                SERVICE_TOKEN=secret
+                ADMIN_PASSWORD=secret
+                DATABASE_PASSWORD=secret
+                RABBIT_PASSWORD=secret
+                SERVICE_PASSWORD=secret
+                #network
+                FLAT_INTERFACE=eth0
+                FIXED_RANGE=20.10.1.0/20
+                NETWORK_GATEWAY=20.10.1.1
+                FIXED_NETWORK_SIZE=4096
+                HOST_IP=$HOST_IP
+                FLOATING_RANGE=20.20.1.0/25
+                Q_FLOATING_ALLOCATION_POOL="start=20.20.1.2,end=20.20.1.253"
+                PUBLIC_NETWORK_GATEWAY=20.20.1.1
+                #multi_host
+                MULTI_HOST=1
+                # Enable Logging
+                LOGFILE=/opt/stack/logs/stack.sh.log
+                VERBOSE=True
+                LOG_COLOR=True
+                SCREEN_LOGDIR=/opt/stack/logs
+                #service
+                disable_service n-net
+                enable_service q-svc
+                enable_service q-agt
+                enable_service q-dhcp
+                enable_service q-l3
+                enable_service q-meta
+                enable_service neutron
+                # Enable Swift
+                enable_service s-proxy
+                enable_service s-object
+                enable_service s-container
+                enable_service s-account
+                SWIFT_HASH=8213897fads879789asdf789
+                # Define the number of Swift Replicas
+                SWIFT_REPLICAS=3
+                Q_PLUGIN=ml2
+                Q_ML2_TENANT_NETWORK_TYPE=vxlan
+                Q_AGENT=linuxbridge
+                # Enable Heat
+                enable_service h-eng h-api h-api-cfn h-api-cw
+                # Plugins - Newton and beyond
+                #enable_plugin heat https://git.openstack.org/openstack/heat stable/mitaka
+                # Download Cloud Images
+                IMAGE_URLS+=",https://pubmirror2.math.uh.edu/fedora-buffet/fedora/linux//releases/25/CloudImages/x86_64/images/Fedora-Cloud-Base-25-1.3.x86_64.qcow2"
+                IMAGE_URLS+=",https://pubmirror2.math.uh.edu/fedora-buffet/fedora/linux//releases/22/Cloud/x86_64/Images/Fedora-Cloud-Base-22-20150521.x86_64.qcow2"
+                IMAGE_URLS+=",https://cloud-images.ubuntu.com/precise/current/precise-server-cloudimg-amd64-disk1.img"
+                IMAGE_URLS+=",https://cloud-images.ubuntu.com/trusty/current/trusty-server-cloudimg-amd64-disk1.img"
+                INAGE_URLS+=",https://cloud-images.ubuntu.com/xenial/current/xenial-server-cloudimg-amd64-disk1.img"
+                IMAGE_URLS+=",http://cloud.centos.org/centos/6/images/CentOS-6-x86_64-GenericCloud-1508.qcow2"
+                IMAGE_URLS+=",http://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2"
+                EOF
+                echo 'net.ipv4.ip_forward=1' | sudo tee --append /etc/sysctl.conf
+                echo 'net.ipv4.conf.default.rp_filter=0' | sudo tee --append /etc/sysctl.conf
+                echo 'net.ipv4.conf.all.rp_filter=0' | sudo tee --append /etc/sysctl.conf
+                sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+                #cat <<EOF | cat > local.sh
+                #for i in `seq 2 10`; do /opt/stack/nova/bin/nova-manage fixed reserve 20.10.1.$i; done
+                #EOF
+                ./stack.sh
+                # Reserve first 10 IPs
+                for i in `seq 2 10`; do /opt/stack/nova/bin/nova-manage fixed reserve 20.10.1.$i; done
+                # Launch a simple webserver on port 6464. Slaves will check this
+                # port: if it listening, they will start to run their slave.sh
+                # script.
+                screen -dm bash -c "python -m SimpleHTTPServer 6464"
+                source openrc admin
+                # Configure DNS server
+                neutron subnet-update public-subnet --dns_nameservers list=true 8.8.8.8
+                neutron subnet-update private-subnet --dns_nameservers list=true 8.8.8.8
+                # Add security group rule to allow ICMP, SSH, and HTTP
+                nova secgroup-add-rule default icmp -1 -1 0.0.0.0/0
+                nova secgroup-add-rule default tcp 22 22 0.0.0.0/0
+                nova secgroup-add-rule default tcp 80 80 0.0.0.0/0
+            path: /home/stack/start.sh
+            permissions: 0755
+        runcmd:
+          - cd /home/stack
+          - pwd
+          - su -l stack ./start.sh
+
+
+  compute_node:
+    type: OS::Heat::ResourceGroup
+    properties:
+      count: { get_param: compute_node_count }
+      resource_def:
+        type: OS::Nova::Server
+        properties:
+          name: ComputeNode%index%
+          flavor: baremetal
+          image: CC-Ubuntu14.04
+          key_name: { get_param: key_name }
+          networks:
+             - network: sharednet1
+          scheduler_hints: { reservation: { get_param: reservation_id } }
+          user_data_format: RAW
+          user_data:
+            str_replace:
+              params:
+                $master_ip$: { get_attr: [control_node, first_address] }
+              template: |
+                #cloud-config
+                users:
+                  - default
+                  - name: stack
+                    lock_passwd: False
+                    sudo: ["ALL=(ALL) NOPASSWD:ALL\nDefaults:stack !requiretty"]
+                    shell: /bin/bash
+                write_files:
+                  - content: |
+                        #!/bin/bash
+                        sudo set -x
+                        sudo exec &> >(tee -a /home/stack/postlog.log)
+                        sudo apt-get update
+                        sudo apt-get install -y git python-pip vim
+                        sudo apt-get upgrade -y python
+                        sudo chown stack:stack /home/stack
+                        touch host
+                        sudo sed -e "s/[        ]*127.0.0.1[    ]*localhost[    ]*$/127.0.0.1 localhost $HOSTNAME/" /etc/hosts > host
+                        sudo cp -f host /etc/hosts
+                        #sudo su -c "useradd stack -s /bin/bash -m -g cc -G cc"
+                        #sudo sed -i '$a stack ALL=(ALL) NOPASSWD: ALL' /etc/sudoers
+                        cd /home/stack
+                        git clone https://github.com/openstack-dev/devstack.git -b stable/mitaka
+                        sudo chown -R stack:stack /home/stack/*
+                        cd devstack
+                        git apply <<EOF
+                        diff --git a/tools/install_pip.sh b/tools/install_pip.sh
+                        index 5d314c8..a9c5fd0 100755
+                        --- a/tools/install_pip.sh
+                        +++ b/tools/install_pip.sh
+                        @@ -135,8 +135,8 @@ fi
+                         
+                         set -x
+                         
+                        -# Note setuptools is part of requirements.txt and we want to make sure
+                        -# we obey any versioning as described there.
+                        -pip_install_gr setuptools
+                        +# Pin setuptools to avoid breakage caused by openstack.nose-plugin (see
+                        +# https://bugs.launchpad.net/devstack/+bug/1651292/ for details).
+                        +pip_install -U setuptools==30.4.0
+                         
+                         get_versions
+                        EOF
+                        SERVICE_HOST=$master_ip$
+                        HOST_IP=$(/sbin/ifconfig eth0 | grep 'inet addr' | cut -d: -f2 | awk '{print $1}')
+                        #VAR=$(ip addr | grep 'state UP' -A2 | tail -n1 | awk '{print $2}' | cut -f1  -d'/')
+                        #printf '\nHOST_IP=%s'$VAR'\n' >> local.conf
+                        touch interface
+                        cat <<EOF | cat > interface
+                        auto eth0
+                        iface eth0 inet static
+                                address $HOST_IP
+                                netmask 255.255.254.0
+                                broadcast 10.40.1.255
+                                gateway 10.40.1.254
+                        EOF
+                        sudo cp -f interface /etc/network/interfaces
+                        #sudo ifdown eth0
+                        #sudo ifup eth0
+                        cat <<EOF | cat > local.conf
+                        [[local|localrc]]
+                        #credential
+                        SERVICE_TOKEN=secret
+                        ADMIN_PASSWORD=secret
+                        DATABASE_PASSWORD=secret
+                        RABBIT_PASSWORD=secret
+                        SERVICE_PASSWORD=secret
+                        #network
+                        FLAT_INTERFACE=eth0
+                        FIXED_RANGE=20.10.1.0/20
+                        NETWORK_GATEWAY=20.10.1.1
+                        FIXED_NETWORK_SIZE=4096
+                        HOST_IP=$HOST_IP
+                        FLOATING_RANGE=20.20.1.0/25
+                        Q_FLOATING_ALLOCATION_POOL="start=20.20.0.2,end=20.20.0.253"
+                        PUBLIC_NETWORK_GATEWAY=20.20.1.1
+                        #multi_host
+                        MULTI_HOST=1
+                        SERVICE_HOST=$SERVICE_HOST
+                        DATABASE_TYPE=mysql
+                        MYSQL_HOST=$SERVICE_HOST
+                        RABBIT_HOST=$SERVICE_HOST
+                        GLANCE_HOSTPORT=$SERVICE_HOST:9292
+                        Q_HOST=$SERVICE_HOST
+                        KEYSTONE_AUTH_HOST=$SERVICE_HOST
+                        KEYSTONE_SERVICE_HOST=$SERVICE_HOST
+                        CINDER_SERVICE_HOST=$SERVICE_HOST
+                        NOVA_VNC_ENABLED=True
+                        NOVNCPROXY_URL="http://$SERVICE_HOST:6080/vnc_auto.html"
+                        VNCSERVER_LISTEN=$HOST_IP
+                        VNCSERVER_PROXYCLIENT_ADDRESS=$HOST_IP
+                        #service
+                        ENABLED_SERVICES=n-cpu,n-api,n-api-meta,neutron,q-agt,q-meta,c-vol,placement-client
+                        Q_PLUGIN=ml2
+                        Q_ML2_TENANT_NETWORK_TYPE=vxlan
+                        Q_AGENT=linuxbridge
+                        # Enable Logging
+                        LOGFILE=/opt/stack/logs/stack.sh.log
+                        VERBOSE=True
+                        LOG_COLOR=True
+                        SCREEN_LOGDIR=/opt/stack/logs
+                        EOF
+                        echo 'net.ipv4.ip_forward=1' | sudo tee --append /etc/sysctl.conf
+                        echo 'net.ipv4.conf.default.rp_filter=0' | sudo tee --append /etc/sysctl.conf
+                        echo 'net.ipv4.conf.all.rp_filter=0' | sudo tee --append /etc/sysctl.conf
+                        sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+                        # Check wait until the controller node has completed his
+                        # devstack installation.
+                        until $(curl --output /dev/null --silent --head --fail http://$master_ip$:6464); do printf '.'; sleep 1; done;
+                        ./stack.sh
+                    path: /home/stack/start.sh
+                    permissions: 0755
+                runcmd:
+                  - cd /home/stack
+                  - pwd
+                  - su -l stack ./start.sh
