@@ -139,8 +139,11 @@ resources:
                 # port: if it listening, they will start to run their slave.sh
                 # script.
                 screen -dm bash -c "python -m SimpleHTTPServer 6464"
-                source openrc admin admin
+                # Share demo private network to admin users
+                source openrc admin demo
+                openstack network set --share private
                 # Configure DNS server
+                source openrc admin admin
                 neutron subnet-update public-subnet --dns_nameservers list=true 8.8.8.8
                 neutron subnet-update private-subnet --dns_nameservers list=true 8.8.8.8
                 # Add security group rule to allow ICMP, SSH, and HTTP
